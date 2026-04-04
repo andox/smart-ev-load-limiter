@@ -1,0 +1,638 @@
+blueprint:
+  name: Smart EV Load Limiter
+  description: >-
+    Dynamically reduces EV charging current so your total household power stays
+    below a configured limit. Reads a whole-house power sensor, optionally
+    subtracts live EV charging power, respects a user-defined preferred max amp
+    setting, supports schedule-based activation, and allows a timed snooze for
+    manual override.
+  domain: automation
+  source_url: https://github.com/andox/smart-ev-load-limiter
+
+  input:
+    house_power_sensor:
+      name: House power sensor
+      description: Live household power sensor. Sensors reporting W or kW are supported.
+      selector:
+        entity:
+          filter:
+            - domain: sensor
+              device_class: power
+
+    power_accounting_mode:
+      name: Power accounting mode
+      description: >-
+        Choose whether the house power sensor already excludes EV charging or
+        whether the blueprint should subtract EV charging power from the total.
+      default: whole_house_including_ev
+      selector:
+        select:
+          options:
+            - label: Whole house including EV charging
+              value: whole_house_including_ev
+            - label: House base load already excludes EV charging
+              value: base_load_excluding_ev
+
+    ev_power_sensor:
+      name: EV charging power sensor
+      description: >-
+        Optional live EV charging power sensor. In "Whole house including EV
+        charging" mode the blueprint prefers this actual reading and otherwise
+        estimates EV charging power from the charger's current amp limit.
+      default: ""
+      selector:
+        entity:
+          filter:
+            - domain: sensor
+              device_class: power
+
+    charger_limit_entity:
+      name: Charger current limit entity
+      description: Number entity used to set the charger maximum current in amps.
+      selector:
+        entity:
+          filter:
+            - domain: number
+              device_class: current
+
+    charge_state_sensor:
+      name: Charge state sensor
+      description: Sensor or binary sensor that indicates whether the car is actively charging.
+      selector:
+        entity: {}
+
+    charging_states:
+      name: Charging states
+      description: >-
+        States from the charge state sensor that count as an active charging
+        session. For DEFA, suspended_evse should usually be included so a
+        temporarily EVSE-paused session is still managed by the limiter.
+      default:
+        - charging
+        - suspended_evse
+      selector:
+        object: {}
+
+    house_max_power_w:
+      name: House max power
+      description: Hard household power cap in watts.
+      default: 10500
+      selector:
+        number:
+          min: 0
+          max: 100000
+          step: 100
+          unit_of_measurement: W
+          mode: box
+
+    preferred_max_amps:
+      name: Preferred max charging current
+      description: >-
+        Your normal charger current limit in amps. The blueprint treats this as
+        the persistent user preference and will never exceed it.
+      default: 16
+      selector:
+        number:
+          min: 0
+          max: 64
+          step: 1
+          unit_of_measurement: A
+          mode: slider
+
+    minimum_charging_amps:
+      name: Minimum charging current
+      description: >-
+        Lowest charging current you consider usable. When the computed limit is
+        below this value, the blueprint will set 0 A if the charger allows it,
+        otherwise it falls back to this minimum.
+      default: 6
+      selector:
+        number:
+          min: 0
+          max: 64
+          step: 1
+          unit_of_measurement: A
+          mode: slider
+
+    minimum_limiter_amps:
+      name: Minimum limiter current
+      description: >-
+        Lowest current this blueprint is allowed to set while it is actively
+        limiting. Use this to keep a higher floor than the charger's own
+        minimum if you want to avoid very slow charging.
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 64
+          step: 1
+          unit_of_measurement: A
+          mode: slider
+
+    phase_count:
+      name: Charging phase count
+      description: Number of active charging phases used to convert watts to amps.
+      default: 3
+      selector:
+        number:
+          min: 1
+          max: 3
+          step: 1
+          mode: slider
+
+    volts_per_phase:
+      name: Voltage per phase
+      description: Voltage used for the watts-to-amps conversion.
+      default: 220
+      selector:
+        number:
+          min: 100
+          max: 400
+          step: 1
+          unit_of_measurement: V
+          mode: box
+
+    always_active:
+      name: Always active
+      description: Enable the limiter all day, every day.
+      default: true
+      selector:
+        boolean: {}
+
+    active_weekdays:
+      name: Active weekdays
+      description: Weekdays when the limiter is allowed to run when always-active is off.
+      default:
+        - mon
+        - tue
+        - wed
+        - thu
+        - fri
+        - sat
+        - sun
+      selector:
+        select:
+          multiple: true
+          options:
+            - label: Monday
+              value: mon
+            - label: Tuesday
+              value: tue
+            - label: Wednesday
+              value: wed
+            - label: Thursday
+              value: thu
+            - label: Friday
+              value: fri
+            - label: Saturday
+              value: sat
+            - label: Sunday
+              value: sun
+
+    active_start_time:
+      name: Active start time
+      description: Start time for the active window when always-active is off.
+      default: "00:00:00"
+      selector:
+        time: {}
+
+    active_end_time:
+      name: Active end time
+      description: End time for the active window when always-active is off.
+      default: "00:00:00"
+      selector:
+        time: {}
+
+    poll_interval_minutes:
+      name: Poll interval
+      description: Safety recheck interval in minutes.
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 60
+          step: 1
+          unit_of_measurement: min
+          mode: slider
+
+    minimum_adjustment_amps:
+      name: Minimum adjustment delta
+      description: Only change the charger current when the newly calculated target differs by at least this many amps.
+      default: 2
+      selector:
+        number:
+          min: 1
+          max: 10
+          step: 1
+          unit_of_measurement: A
+          mode: slider
+
+    adjustment_cooldown:
+      name: Adjustment cooldown
+      description: Minimum time to wait between automatic charger current changes.
+      default:
+        seconds: 45
+      selector:
+        duration: {}
+
+    enable_notifications:
+      name: Enable notifications
+      description: Notify when the limiter actively reduces the charger below your preferred max current.
+      default: false
+      selector:
+        boolean: {}
+
+    notify_devices:
+      name: Devices to notify
+      description: Mobile App devices that should receive limiter notifications.
+      default: []
+      selector:
+        device:
+          integration: mobile_app
+          multiple: true
+
+    create_ha_notification:
+      name: Create Home Assistant notification
+      description: Also create a persistent notification inside Home Assistant when limiter notifications are enabled.
+      default: true
+      selector:
+        boolean: {}
+
+    snooze_button:
+      name: Snooze button (optional)
+      description: >-
+        Input button helper used to suspend limiter writes temporarily and allow
+        manual override of the charger current.
+      default: ""
+      selector:
+        entity:
+          domain: input_button
+
+    snooze_duration:
+      name: Snooze duration
+      description: How long the snooze button or a manual charger-limit change should bypass the limiter.
+      default:
+        hours: 2
+        minutes: 0
+        seconds: 0
+      selector:
+        duration: {}
+
+mode: restart
+
+trigger_variables:
+  poll_interval_minutes: !input poll_interval_minutes
+
+variables:
+  house_power_sensor: !input house_power_sensor
+  power_accounting_mode: !input power_accounting_mode
+  ev_power_sensor: !input ev_power_sensor
+  charger_limit_entity: !input charger_limit_entity
+  charge_state_sensor: !input charge_state_sensor
+  charging_states: !input charging_states
+  house_max_power_w: !input house_max_power_w
+  preferred_max_amps: !input preferred_max_amps
+  minimum_charging_amps: !input minimum_charging_amps
+  minimum_limiter_amps: !input minimum_limiter_amps
+  phase_count: !input phase_count
+  volts_per_phase: !input volts_per_phase
+  always_active: !input always_active
+  active_weekdays: !input active_weekdays
+  active_start_time: !input active_start_time
+  active_end_time: !input active_end_time
+  minimum_adjustment_amps: !input minimum_adjustment_amps
+  adjustment_cooldown: !input adjustment_cooldown
+  enable_notifications: !input enable_notifications
+  notify_devices: !input notify_devices
+  create_ha_notification: !input create_ha_notification
+  snooze_button: !input snooze_button
+  snooze_duration: !input snooze_duration
+
+trigger:
+  - platform: state
+    entity_id: !input house_power_sensor
+    id: house_power_changed
+
+  - platform: state
+    entity_id: !input charge_state_sensor
+    id: charge_state_changed
+
+  - platform: event
+    event_type: call_service
+    id: snooze_button_pressed
+    event_data:
+      domain: input_button
+      service: press
+
+  - platform: time
+    at: !input active_start_time
+    id: schedule_start
+
+  - platform: time
+    at: !input active_end_time
+    id: schedule_end
+
+  - platform: time_pattern
+    minutes: "*"
+    id: periodic_check
+
+  - platform: event
+    event_type: automation_reloaded
+    id: automation_reloaded
+
+  - platform: homeassistant
+    event: start
+    id: homeassistant_started
+
+action:
+  - variables:
+      invalid_states:
+        - unknown
+        - unavailable
+        - none
+        - ""
+      now_ts: "{{ as_timestamp(now()) }}"
+      periodic_trigger_due: >
+        {{ trigger.id != 'periodic_check'
+           or ((now().minute % ([poll_interval_minutes | int(1), 1] | max)) == 0) }}
+      notification_title: "Smart EV Load Limiter"
+      notifications_configured: >
+        {{ enable_notifications and ((notify_devices | default([], true) | length > 0) or create_ha_notification) }}
+      charge_state_value: "{{ states(charge_state_sensor) }}"
+      is_charging: "{{ charge_state_value in (charging_states | default([], true)) }}"
+      weekday_key: "{{ ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'][now().weekday()] }}"
+      time_now: "{{ now().strftime('%H:%M:%S') }}"
+      in_time_window: >
+        {% if active_start_time == active_end_time %}
+          {{ true }}
+        {% elif active_start_time < active_end_time %}
+          {{ active_start_time <= time_now < active_end_time }}
+        {% else %}
+          {{ time_now >= active_start_time or time_now < active_end_time }}
+        {% endif %}
+      schedule_active: >
+        {{ always_active or ((weekday_key in (active_weekdays | default([], true))) and (in_time_window | bool)) }}
+      house_power_raw: "{{ states(house_power_sensor) }}"
+      house_power_unit: "{{ state_attr(house_power_sensor, 'unit_of_measurement') | default('W', true) | string | lower | replace(' ', '') }}"
+      house_power_available: "{{ house_power_raw not in invalid_states }}"
+      house_power_w: >
+        {% if house_power_raw in invalid_states %}
+          {{ none }}
+        {% else %}
+          {% set value = house_power_raw | float(0) %}
+          {% if house_power_unit == 'kw' %}
+            {{ value * 1000 }}
+          {% else %}
+            {{ value }}
+          {% endif %}
+        {% endif %}
+      charger_limit_raw: "{{ states(charger_limit_entity) }}"
+      charger_limit_available: "{{ charger_limit_raw not in invalid_states }}"
+      current_limit_amps: >
+        {% if charger_limit_raw in invalid_states %}
+          {{ none }}
+        {% else %}
+          {{ charger_limit_raw | float(0) }}
+        {% endif %}
+      charger_min_supported_amps: "{{ state_attr(charger_limit_entity, 'min') | float(0) }}"
+      charger_max_supported_amps: "{{ state_attr(charger_limit_entity, 'max') | float(preferred_max_amps) }}"
+      charger_supports_zero: "{{ charger_min_supported_amps <= 0 }}"
+      effective_minimum_amps: >
+        {{ [minimum_charging_amps | int(0), minimum_limiter_amps | int(0), (charger_min_supported_amps | round(0, 'ceil')) | int(0)] | max }}
+      preferred_ceiling_amps: >
+        {{ [preferred_max_amps | int(0), (charger_max_supported_amps | round(0, 'floor')) | int(preferred_max_amps)] | min }}
+      watts_per_amp: "{{ (phase_count | float(1)) * (volts_per_phase | float(230)) }}"
+      ev_power_required: "{{ power_accounting_mode == 'whole_house_including_ev' }}"
+      ev_power_sensor_configured: "{{ ev_power_sensor | default('', true) | length > 0 }}"
+      ev_power_raw: >
+        {% if ev_power_sensor_configured %}
+          {{ states(ev_power_sensor) }}
+        {% else %}
+          {{ '' }}
+        {% endif %}
+      ev_power_unit: >
+        {% if ev_power_sensor_configured %}
+          {{ state_attr(ev_power_sensor, 'unit_of_measurement') | default('W', true) | string | lower | replace(' ', '') }}
+        {% else %}
+          {{ 'w' }}
+        {% endif %}
+      ev_power_source: >
+        {% if not ev_power_required %}
+          none
+        {% elif ev_power_sensor_configured and (ev_power_raw not in invalid_states) %}
+          sensor
+        {% elif charger_limit_available and is_charging and (watts_per_amp | float(0) > 0) %}
+          estimated_from_limit
+        {% else %}
+          unavailable
+        {% endif %}
+      ev_power_available: "{{ (not ev_power_required) or (ev_power_source != 'unavailable') }}"
+      ev_power_w: >
+        {% if not ev_power_required %}
+          0
+        {% elif ev_power_source == 'sensor' %}
+          {% set value = ev_power_raw | float(0) %}
+          {% if ev_power_unit == 'kw' %}
+            {{ value * 1000 }}
+          {% else %}
+            {{ value }}
+          {% endif %}
+        {% elif ev_power_source == 'estimated_from_limit' %}
+          {{ (current_limit_amps | float(0)) * (watts_per_amp | float(0)) }}
+        {% else %}
+          {{ none }}
+        {% endif %}
+      snooze_duration_seconds: >
+        {% set d = snooze_duration %}
+        {% set days = d.days | default(0) | int %}
+        {% set hours = d.hours | default(0) | int %}
+        {% set minutes = d.minutes | default(0) | int %}
+        {% set seconds = d.seconds | default(0) | int %}
+        {{ days * 86400 + hours * 3600 + minutes * 60 + seconds }}
+      snooze_button_timestamp: >
+        {% if snooze_button | default('', true) | length == 0 %}
+          0
+        {% else %}
+          {% set pressed_at = as_datetime(states(snooze_button), default=none) %}
+          {{ as_timestamp(pressed_at, 0) if pressed_at else 0 }}
+        {% endif %}
+      button_snooze_active: >
+        {{ (snooze_button | default('', true) | length > 0)
+           and (snooze_duration_seconds | int(0) > 0)
+           and (snooze_button_timestamp | float(0) > 0)
+           and ((now_ts | float(0)) - (snooze_button_timestamp | float(0)) < (snooze_duration_seconds | int(0))) }}
+      charger_last_change_ts: "{{ as_timestamp(states[charger_limit_entity].last_changed, 0) }}"
+      charger_last_change_user_id: >
+        {{ states[charger_limit_entity].context.user_id
+           if states[charger_limit_entity] is not none and states[charger_limit_entity].context is not none
+           else none }}
+      adjustment_cooldown_seconds: >
+        {% set d = adjustment_cooldown %}
+        {% set days = d.days | default(0) | int %}
+        {% set hours = d.hours | default(0) | int %}
+        {% set minutes = d.minutes | default(0) | int %}
+        {% set seconds = d.seconds | default(0) | int %}
+        {{ days * 86400 + hours * 3600 + minutes * 60 + seconds }}
+      sensor_values_available: >
+        {{ house_power_available and charger_limit_available and ((not ev_power_required) or ev_power_available) }}
+      base_load_w: >
+        {% if not sensor_values_available %}
+          {{ none }}
+        {% elif power_accounting_mode == 'base_load_excluding_ev' %}
+          {{ [house_power_w | float(0), 0] | max }}
+        {% else %}
+          {{ [(house_power_w | float(0)) - (ev_power_w | float(0)), 0] | max }}
+        {% endif %}
+      available_ev_w: >
+        {% if base_load_w is none %}
+          {{ none }}
+        {% else %}
+          {{ [(house_max_power_w | float(0)) - (base_load_w | float(0)), 0] | max }}
+        {% endif %}
+      raw_target_amps: >
+        {% if available_ev_w is none or (watts_per_amp | float(0)) <= 0 %}
+          {{ none }}
+        {% else %}
+          {{ ((available_ev_w | float(0)) / (watts_per_amp | float(0))) | int(0) }}
+        {% endif %}
+      computed_target_amps: >
+        {% if raw_target_amps is none %}
+          {{ none }}
+        {% else %}
+          {% set upper = preferred_ceiling_amps | int(0) %}
+          {% set clamped = [[raw_target_amps | int(0), upper] | min, 0] | max %}
+          {% if clamped > 0 and clamped < (effective_minimum_amps | int(0)) %}
+            {% if charger_supports_zero %}
+              0
+            {% else %}
+              {{ [effective_minimum_amps | int(0), upper] | min }}
+            {% endif %}
+          {% else %}
+            {{ clamped }}
+          {% endif %}
+        {% endif %}
+      manual_snooze_active: >
+        {{ (snooze_duration_seconds | int(0) > 0)
+           and (charger_last_change_user_id is not none)
+           and ((now_ts | float(0)) - (charger_last_change_ts | float(0)) < (snooze_duration_seconds | int(0)))
+           and schedule_active
+           and is_charging
+           and (computed_target_amps is not none)
+           and ((current_limit_amps | round(0, 'floor') | int(0)) > (computed_target_amps | int(0))) }}
+      snooze_active: "{{ button_snooze_active or manual_snooze_active }}"
+      target_delta_amps: >
+        {% if current_limit_amps is none or computed_target_amps is none %}
+          {{ none }}
+        {% else %}
+          {{ ((current_limit_amps | round(0, 'floor') | int(0)) - (computed_target_amps | int(0))) | abs }}
+        {% endif %}
+      adjustment_threshold_met: >
+        {{ current_limit_amps is none
+           or computed_target_amps is none
+           or (target_delta_amps | int(0)) >= (minimum_adjustment_amps | int(1)) }}
+      adjustment_cooldown_elapsed: >
+        {{ ((now_ts | float(0)) - (charger_last_change_ts | float(0))) >= (adjustment_cooldown_seconds | int(0)) }}
+      should_notify_limit_reduction: >
+        {{ notifications_configured
+           and (current_limit_amps is not none)
+           and (computed_target_amps is not none)
+           and ((computed_target_amps | int(0)) < (preferred_ceiling_amps | int(0)))
+           and ((computed_target_amps | int(0)) < (current_limit_amps | round(0, 'floor') | int(0))) }}
+      notification_message: >
+        House load is {{ (house_power_w | float(0)) | round(0) | int(0) }} W and
+        the charger was reduced from
+        {{ current_limit_amps | round(0, 'floor') | int(0) }} A to
+        {{ computed_target_amps | int(0) }} A to stay below
+        {{ house_max_power_w | int(0) }} W.
+
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ not periodic_trigger_due }}"
+        sequence: []
+
+      - conditions:
+          - condition: trigger
+            id: snooze_button_pressed
+          - condition: template
+            value_template: >
+              {% set service_entity_id = trigger.event.data.service_data.entity_id | default([], true) %}
+              {% if service_entity_id is string %}
+                {{ (snooze_button | default('', true) | length > 0) and service_entity_id == snooze_button }}
+              {% elif service_entity_id is sequence %}
+                {{ (snooze_button | default('', true) | length > 0) and (snooze_button in (service_entity_id | list)) }}
+              {% else %}
+                false
+              {% endif %}
+          - condition: template
+            value_template: >
+              {{ current_limit_amps is not none
+                 and (current_limit_amps | round(0, 'floor') | int(0)) != (preferred_ceiling_amps | int(0)) }}
+        sequence:
+          - service: number.set_value
+            target:
+              entity_id: !input charger_limit_entity
+            data:
+              value: "{{ preferred_ceiling_amps | int(0) }}"
+
+      - conditions:
+          - condition: template
+            value_template: "{{ not sensor_values_available }}"
+        sequence: []
+
+      - conditions:
+          - condition: template
+            value_template: "{{ snooze_active }}"
+        sequence: []
+
+      - conditions:
+          - condition: template
+            value_template: "{{ (not schedule_active) or (not is_charging) }}"
+          - condition: template
+            value_template: "{{ current_limit_amps is not none and (current_limit_amps | round(0, 'floor') | int(0)) != (preferred_ceiling_amps | int(0)) }}"
+        sequence:
+          - service: number.set_value
+            target:
+              entity_id: !input charger_limit_entity
+            data:
+              value: "{{ preferred_ceiling_amps | int(0) }}"
+
+      - conditions:
+          - condition: template
+            value_template: "{{ computed_target_amps is not none }}"
+          - condition: template
+            value_template: "{{ current_limit_amps is none or (current_limit_amps | round(0, 'floor') | int(0)) != (computed_target_amps | int(0)) }}"
+          - condition: template
+            value_template: "{{ adjustment_threshold_met }}"
+          - condition: template
+            value_template: "{{ adjustment_cooldown_elapsed }}"
+        sequence:
+          - service: number.set_value
+            target:
+              entity_id: !input charger_limit_entity
+            data:
+              value: "{{ computed_target_amps | int(0) }}"
+          - if:
+              - condition: template
+                value_template: "{{ should_notify_limit_reduction }}"
+            then:
+              - if:
+                  - condition: template
+                    value_template: "{{ create_ha_notification }}"
+                then:
+                  - service: persistent_notification.create
+                    data:
+                      title: "{{ notification_title }}"
+                      message: "{{ notification_message }}"
+                      notification_id: smart_ev_load_limiter_limited
+              - repeat:
+                  for_each: "{{ notify_devices | default([], true) }}"
+                  sequence:
+                    - variables:
+                        repeat_device_name: "{{ device_attr(repeat.item, 'name') }}"
+                    - condition: template
+                      value_template: "{{ repeat_device_name | default('', true) | length > 0 }}"
+                    - service: "{{ 'notify.mobile_app_' ~ (repeat_device_name | slugify) }}"
+                      data:
+                        title: "{{ notification_title }}"
+                        message: "{{ notification_message }}"
