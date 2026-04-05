@@ -65,11 +65,21 @@ blueprint:
       name: Charging states
       description: >-
         States from the charge state sensor that count as an active charging
-        session. For DEFA, suspended_evse should usually be included so a
-        temporarily EVSE-paused session is still managed by the limiter.
+        session. Paused charger-session states should be configured separately.
       default:
         - charging
+      selector:
+        object: {}
+
+    paused_session_states:
+      name: Paused session states
+      description: >-
+        States from the charge state sensor that mean the session is paused but
+        still connected. While in one of these states, the blueprint leaves the
+        charger current untouched.
+      default:
         - suspended_evse
+        - suspended_ev
       selector:
         object: {}
 
@@ -90,6 +100,21 @@ blueprint:
       description: >-
         Your normal charger current limit in amps. The blueprint treats this as
         the persistent user preference and will never exceed it.
+      default: 16
+      selector:
+        number:
+          min: 0
+          max: 64
+          step: 1
+          unit_of_measurement: A
+          mode: slider
+
+    non_charging_max_amps:
+      name: Non-charging current limit
+      description: >-
+        Current limit to restore when the limiter is inactive or the car is not
+        charging. Use this as the safer fallback current when the blueprint is
+        idle.
       default: 16
       selector:
         number:
@@ -290,8 +315,10 @@ variables:
   charger_limit_entity: !input charger_limit_entity
   charge_state_sensor: !input charge_state_sensor
   charging_states: !input charging_states
+  paused_session_states: !input paused_session_states
   house_max_power_w: !input house_max_power_w
   preferred_max_amps: !input preferred_max_amps
+  non_charging_max_amps: !input non_charging_max_amps
   minimum_charging_amps: !input minimum_charging_amps
   minimum_limiter_amps: !input minimum_limiter_amps
   phase_count: !input phase_count
@@ -360,6 +387,7 @@ action:
         {{ enable_notifications and ((notify_devices | default([], true) | length > 0) or create_ha_notification) }}
       charge_state_value: "{{ states(charge_state_sensor) }}"
       is_charging: "{{ charge_state_value in (charging_states | default([], true)) }}"
+      is_paused_session: "{{ charge_state_value in (paused_session_states | default([], true)) }}"
       weekday_key: "{{ ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'][now().weekday()] }}"
       time_now: "{{ now().strftime('%H:%M:%S') }}"
       in_time_window: >
@@ -401,6 +429,13 @@ action:
         {{ [minimum_charging_amps | int(0), minimum_limiter_amps | int(0), (charger_min_supported_amps | round(0, 'ceil')) | int(0)] | max }}
       preferred_ceiling_amps: >
         {{ [preferred_max_amps | int(0), (charger_max_supported_amps | round(0, 'floor')) | int(preferred_max_amps)] | min }}
+      inactive_restore_amps: >
+        {% set requested = [non_charging_max_amps | int(0), (charger_max_supported_amps | round(0, 'floor')) | int(non_charging_max_amps)] | min %}
+        {% if requested <= 0 and charger_supports_zero %}
+          0
+        {% else %}
+          {{ [requested, (charger_min_supported_amps | round(0, 'ceil')) | int(0)] | max }}
+        {% endif %}
       watts_per_amp: "{{ (phase_count | float(1)) * (volts_per_phase | float(230)) }}"
       ev_power_required: "{{ power_accounting_mode == 'whole_house_including_ev' }}"
       ev_power_sensor_configured: "{{ ev_power_sensor | default('', true) | length > 0 }}"
@@ -517,6 +552,7 @@ action:
            and ((now_ts | float(0)) - (charger_last_change_ts | float(0)) < (snooze_duration_seconds | int(0)))
            and schedule_active
            and is_charging
+           and (not is_paused_session)
            and (computed_target_amps is not none)
            and ((current_limit_amps | round(0, 'floor') | int(0)) > (computed_target_amps | int(0))) }}
       snooze_active: "{{ button_snooze_active or manual_snooze_active }}"
@@ -587,15 +623,20 @@ action:
 
       - conditions:
           - condition: template
-            value_template: "{{ (not schedule_active) or (not is_charging) }}"
+            value_template: "{{ is_paused_session }}"
+        sequence: []
+
+      - conditions:
           - condition: template
-            value_template: "{{ current_limit_amps is not none and (current_limit_amps | round(0, 'floor') | int(0)) != (preferred_ceiling_amps | int(0)) }}"
+            value_template: "{{ (not schedule_active) or ((not is_charging) and (not is_paused_session)) }}"
+          - condition: template
+            value_template: "{{ current_limit_amps is not none and (current_limit_amps | round(0, 'floor') | int(0)) != (inactive_restore_amps | int(0)) }}"
         sequence:
           - service: number.set_value
             target:
               entity_id: !input charger_limit_entity
             data:
-              value: "{{ preferred_ceiling_amps | int(0) }}"
+              value: "{{ inactive_restore_amps | int(0) }}"
 
       - conditions:
           - condition: template

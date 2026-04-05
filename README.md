@@ -40,9 +40,11 @@ If you update the blueprint after creating an automation from it, open the autom
 | **EV charging power sensor** | Optional actual EV charging power sensor. In `whole_house_including_ev` mode the blueprint prefers this live reading and otherwise estimates EV power from the current charger amp limit. The picker is filtered to power sensors, and this field can now be left empty. | Empty |
 | **Charger current limit entity** | `number` entity used to set charger amps. The picker is filtered to number entities with device class `current`, which should match the DEFA max-current control. | - |
 | **Charge state sensor** | Sensor or binary sensor that reports charging state. | - |
-| **Charging states** | Sensor states treated as an active charging session. For DEFA, include `suspended_evse` so a temporarily EVSE-paused session is still managed. | `["charging", "suspended_evse"]` |
+| **Charging states** | Sensor states treated as an active charging session. | `["charging"]` |
+| **Paused session states** | Sensor states that mean the session is paused but still connected. While in one of these states, the blueprint leaves the charger current untouched. | `["suspended_evse", "suspended_ev"]` |
 | **House max power** | Hard household power cap in watts. | `10500` |
-| **Preferred max charging current** | User-selected normal charger amp limit. The blueprint never exceeds this. | `16 A` |
+| **Preferred max charging current** | User-selected max charger current while actively charging. The blueprint never exceeds this while limiting. | `16 A` |
+| **Non-charging current limit** | Current limit restored when the limiter is inactive or the car is not charging. Use this as the safer fallback current when the blueprint is idle. | `16 A` |
 | **Minimum charging current** | Lowest usable charging current. | `6 A` |
 | **Minimum limiter current** | Lowest current the blueprint is allowed to set while it is actively limiting. Set above the charger minimum if you want to avoid very slow charging. | `0 A` |
 | **Charging phase count** | Number of phases used for the watts-to-amps conversion. | `3` |
@@ -61,8 +63,9 @@ If you update the blueprint after creating an automation from it, open the autom
 
 ## How It Works
 1. If the blueprint is snoozed, it does nothing and leaves the charger untouched.
-2. If the limiter is outside its active schedule, or the car is not charging, it restores the charger to **Preferred max charging current**.
-3. If charging is active:
+2. If the car is in one of the configured paused session states, it does nothing and leaves the current limit untouched.
+3. If the limiter is outside its active schedule, or the car is not charging, it restores the charger to **Non-charging current limit**.
+4. If charging is active:
    - it reads the house power
    - in `whole_house_including_ev` mode it subtracts EV charging power to estimate non-EV base load
    - if an EV power sensor is available, it uses the actual live EV charging power
@@ -71,15 +74,15 @@ If you update the blueprint after creating an automation from it, open the autom
    - it converts that headroom to amps with `amps = floor(watts / (phases * volts))`
    - it clamps the result to the configured preferred maximum
    - it only applies a new charger limit when the change is large enough and the cooldown has elapsed
-4. If the calculated amps fall below the configured minimum:
+5. If the calculated amps fall below the configured minimum:
    - it sets `0 A` when the charger entity allows zero
    - otherwise it falls back to the configured minimum
 
-The blueprint always treats **Preferred max charging current** as the authoritative user preference. It does not learn a new baseline from the current DEFA number value, because that value may only be a temporary limiter result during an active charging session or after a Home Assistant restart.
+The blueprint always treats **Preferred max charging current** as the authoritative charging ceiling while a session is active. It does not learn a new baseline from the current DEFA number value, because that value may only be a temporary limiter result during an active charging session or after a Home Assistant restart.
 
 Using a real EV power sensor is more accurate than estimating from the current charger limit. The estimate is still useful, but it assumes the car is drawing the full allowed current, which may not be true during ramp-up, near full battery, or when the vehicle reduces draw on its own.
 
-For DEFA, the charge state may switch from `charging` to `suspended_evse` when the EVSE pauses the session. That should normally still count as an active session for this blueprint, otherwise it may restore the preferred max current too aggressively.
+For DEFA, the charge state may switch from `charging` to `suspended_evse` when the EVSE pauses the session. By default, this blueprint treats that as a paused session and leaves the charger current untouched until charging resumes or the session fully ends.
 
 ## Manual Override Behavior
 - Pressing the snooze button starts a timed bypass.
@@ -90,22 +93,23 @@ For DEFA, the charge state may switch from `charging` to `suspended_evse` when t
 
 ## Notifications
 - When **Enable notifications** is on, the blueprint notifies only when it actively lowers the charger below both the current setting and your preferred max current.
-- It does not notify on normal restores back to your preferred max, upward adjustments while still limited, or while snoozed.
+- It does not notify on normal restores back to your configured charging or non-charging limits, upward adjustments while still limited, or while snoozed.
 - It can send to selected Mobile App devices.
 - It can also create a persistent Home Assistant notification.
 
 ## Debugging
-- When the automation trace shows no action, open **Changed variables** on the last `choose` step and check: `sensor_values_available`, `snooze_active`, `schedule_active`, `is_charging`, `computed_target_amps`, `target_delta_amps`, `adjustment_threshold_met`, and `adjustment_cooldown_elapsed`.
+- When the automation trace shows no action, open **Changed variables** on the last `choose` step and check: `sensor_values_available`, `snooze_active`, `is_paused_session`, `schedule_active`, `is_charging`, `computed_target_amps`, `target_delta_amps`, `adjustment_threshold_met`, and `adjustment_cooldown_elapsed`.
 - If `current_limit_amps` already equals `computed_target_amps`, the blueprint is intentionally doing nothing.
 - If `snooze_active` is `true`, the limiter is bypassed either because the snooze button is still active or because a recent manual current change was treated as a temporary override.
 
 ## Notes
 - If your charger or vehicle only uses one phase, set **Charging phase count** accordingly.
+- If you want a safer fallback when the limiter is idle or something goes wrong, set **Non-charging current limit** lower than **Preferred max charging current**.
 - If your charger `number` entity cannot be set to `0`, the blueprint cannot strictly enforce the household cap when the safe current would be below the minimum supported charging current.
 - The periodic recheck is also what resumes limiter control after a snooze expires if no relevant entity changes occur exactly at that moment.
 - Automatic snooze from manual charger changes depends on Home Assistant receiving that charger-limit change with a user context, which is true for normal UI edits but may not be true for every third-party app path.
 - The charger current entity is no longer used as a direct trigger, which reduces self-induced feedback loops after the blueprint changes the charger limit itself.
-- The snooze button uses an `input_button.press` service-event trigger because optional entity triggers with an empty input can fail Home Assistant setup validation. As a result, presses on unrelated input buttons may still appear as no-op traces for this automation.
+- The snooze button now uses a direct trigger on the configured `input_button`, so unrelated button presses elsewhere in Home Assistant should no longer create extra no-op traces.
 
 ## License
 This project is released under the MIT License.
