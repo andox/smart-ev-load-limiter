@@ -1,13 +1,14 @@
 # Smart EV Load Limiter
 
-Smart EV Load Limiter is a Home Assistant automation blueprint that continuously adjusts your EV charger's current limit to keep total household power below a configured cap. It is designed for setups such as Tibber plus DEFA, but it stays integration-agnostic by reading generic Home Assistant entities.
+Smart EV Load Limiter is a Home Assistant automation blueprint that continuously adjusts your EV charger's current limit to keep total household power below a configured cap. It can use a separate cap outside a selected normal-cap window. It is designed for setups such as Tibber plus DEFA, but it stays integration-agnostic by reading generic Home Assistant entities.
 
 ## Features
 - Caps charging current based on available household power headroom
 - Supports either whole-house power including EV load or a base-load sensor that already excludes EV charging
 - Converts watts to charger amps using configurable phase count and voltage
 - Respects a persistent user-defined preferred max amps value instead of learning from a possibly temporary throttled charger state, except when a non-zero-minimum charger would otherwise receive an invalid below-minimum setting
-- Supports always-on mode or a weekday/time schedule, including overnight windows
+- Supports an always-normal mode or a weekday/time normal-cap window, including overnight windows
+- Can disable limiting, use a separate cap, or keep the normal cap outside that window
 - Allows timed snooze via an `input_button` helper so you can temporarily override the limiter manually
 - Treats manual charger amp changes from the Home Assistant UI as a temporary override for the snooze duration
 - Limits the entity pickers to power sensors and current-setting number entities so the setup UI is easier to understand
@@ -41,21 +42,23 @@ If you update the blueprint after creating an automation from it, open the autom
 | **Charger current limit entity** | `number` entity used to set charger amps. The picker is filtered to number entities with device class `current`, which should match the DEFA max-current control. | - |
 | **Charge state sensor** | Sensor or binary sensor that reports charging state. | - |
 | **Charging states** | Sensor states treated as an active charging session. | `["charging"]` |
-| **House max power** | Hard household power cap in watts. | `10500` |
+| **House max power** | Household power cap used during the normal-cap window. | `10500 W` |
 | **Preferred max charging current** | User-selected max charger current while actively charging. Normally the limiter never exceeds this, but if it is set below the charger's effective non-zero minimum, the blueprint uses that minimum instead of sending an invalid value. | `16 A` |
 | **Non-charging current limit** | Current limit restored when the limiter is inactive or the car is not charging. Use this as the safer fallback current when the blueprint is idle. | `16 A` |
 | **Minimum charging current** | Lowest usable charging current. | `6 A` |
 | **Stop charging below minimum** | If the safe target falls below the charger minimum and the charger cannot accept `0 A`, press the configured stop-charging button instead of clamping to the minimum. | `false` |
 | **Stop charging button** | Optional button entity used for automatic stop charging. | Empty |
 | **Start charging button** | Optional button entity used to resume charging after an automatic stop. | Empty |
-| **Auto-stop tracking helper** | Optional `input_boolean` used to track automatic stop/start state reliably. Required if you enable automatic stop/start support. | Empty |
+| **Auto-stop tracking helper (required for auto-stop)** | `input_boolean` used to track automatic stop/start state reliably. Automatic stop/start is disabled if this is empty. | Empty |
 | **Stop/start cooldown** | Minimum wait time between automatic stop and start button presses. | `15 min` |
 | **Stop delay below minimum** | How long the charger must stay pinned at the minimum current while headroom is still too low before the blueprint presses stop. | `5 min` |
 | **Charging phase count** | Number of phases used for the watts-to-amps conversion. | `3` |
 | **Voltage per phase** | Voltage used for the watts-to-amps conversion. | `220 V` |
-| **Always active** | Run every day, all day. | `true` |
-| **Active weekdays** | Used only when always-active is off. | All days |
-| **Active start/end time** | Active schedule window, including overnight windows. | `00:00:00` / `00:00:00` |
+| **Always use normal cap** | Ignore the schedule and use the normal power cap every day, all day. | `true` |
+| **Normal-cap weekdays** | Weekdays when the normal power cap applies if the schedule is enabled. | All days |
+| **Normal-cap start/end time** | Normal-cap window, including overnight windows. | `00:00:00` / `00:00:00` |
+| **Outside normal-cap window** | Disable the limiter, continue with a separate power cap, or continue with the normal power cap outside the configured window. | `Disable limiter` |
+| **Outside-window house max power** | Absolute household cap used outside the normal-cap window when separate-cap behavior is selected. It is not added to the normal cap. | `16000 W` |
 | **Poll interval** | Safety recheck interval. | `1 min` |
 | **Minimum adjustment delta** | Only apply a new charger limit when the calculated target differs by at least this many amps. | `2 A` |
 | **Adjustment cooldown** | Minimum wait time between automatic charger current changes. | `45 s` |
@@ -67,20 +70,23 @@ If you update the blueprint after creating an automation from it, open the autom
 
 ## How It Works
 1. If the blueprint is snoozed, it does nothing and leaves the charger untouched.
-2. If the limiter is outside its active schedule, or the car is not charging, it restores the charger to **Non-charging current limit** unless the blueprint is holding an auto-stopped session for a later safe restart.
-3. If charging is active:
+2. During the configured normal-cap weekdays and hours, it uses **House max power**. Outside that window it follows **Outside normal-cap window**:
+   - **Disable limiter** restores **Non-charging current limit**, preserving the behavior of earlier blueprint versions.
+   - **Use separate power cap** continues load balancing with **Outside-window house max power**.
+   - **Keep normal power cap** continues load balancing with **House max power**.
+3. If the limiter is enabled and charging is active:
    - it reads the house power
    - in `whole_house_including_ev` mode it subtracts EV charging power to estimate non-EV base load
    - if an EV power sensor is available, it uses the actual live EV charging power
    - otherwise it estimates EV charging power from `current charger amps * phases * volts`
-   - it computes remaining power headroom
+   - it computes remaining power headroom against the cap currently in effect
    - it converts that headroom to amps with `amps = floor(watts / (phases * volts))`
    - it clamps the result to the configured preferred maximum, except that a charger with a non-zero minimum is clamped to that effective minimum if your preferred max is set lower than the charger can actually accept
    - it only applies a new charger limit when the change is large enough and the cooldown has elapsed
-4. If the calculated amps fall below the configured minimum:
+4. If the calculated amps fall below the configured minimum while the limiter is enabled:
    - it sets `0 A` when the charger configuration allows zero
    - if **Stop charging below minimum** is enabled and you configured the stop/start helper, it can press the configured stop button instead of clamping to the minimum once the below-minimum condition has stayed true for the configured stop delay and the charger is still pinned at its minimum current
-   - after an automatic stop, it keeps the session in that stopped state until headroom returns and then sets the safe target current before pressing the start button
+   - after an automatic stop, it keeps the session in that stopped state until headroom returns under the cap currently in effect, then sets the safe target current before pressing the start button
    - otherwise it falls back to the configured minimum
 
 The blueprint treats **Preferred max charging current** as the normal charging ceiling while a session is active. It does not learn a new baseline from the current DEFA number value, because that value may only be a temporary limiter result during an active charging session or after a Home Assistant restart. If you configure **Preferred max charging current** below the charger's effective non-zero minimum, the charger minimum wins because Home Assistant cannot safely apply a lower valid number.
@@ -101,7 +107,7 @@ Using a real EV power sensor is more accurate than estimating from the current c
 - It can also create a persistent Home Assistant notification.
 
 ## Debugging
-- When the automation trace shows no action, open **Changed variables** on the last `choose` step and check: `sensor_values_available`, `snooze_active`, `schedule_active`, `is_charging`, `computed_target_amps`, `target_delta_amps`, `adjustment_threshold_met`, and `adjustment_cooldown_elapsed`.
+- When the automation trace shows no action, open **Changed variables** on the last `choose` step and check: `sensor_values_available`, `snooze_active`, `normal_cap_window_active`, `limiter_active`, `outside_window_separate_cap_active`, `effective_house_max_power_w`, `is_charging`, `computed_target_amps`, `target_delta_amps`, `adjustment_threshold_met`, and `adjustment_cooldown_elapsed`.
 - If `current_limit_amps` already equals `computed_target_amps`, the blueprint is intentionally doing nothing.
 - If `snooze_active` is `true`, the limiter is bypassed either because the snooze button is still active or because a recent manual current change was treated as a temporary override.
 
@@ -109,6 +115,7 @@ Using a real EV power sensor is more accurate than estimating from the current c
 - If your charger or vehicle only uses one phase, set **Charging phase count** accordingly.
 - If you want a safer fallback when the limiter is idle or something goes wrong, set **Non-charging current limit** lower than **Preferred max charging current**.
 - Overnight schedules use the selected weekday as the window start day, so a Monday `22:00` to `06:00` window remains active until Tuesday `06:00`.
+- For a normal cap every day from 07:00 through 20:59 and a looser cap overnight, turn off **Always use normal cap**, select every weekday, set the window to `07:00:00`–`21:00:00`, choose **Use separate power cap**, and set an outside-window cap higher than the normal cap. The blueprint does not apply a calendar activation date automatically.
 - If your charger cannot be set to `0`, enable **Stop charging below minimum** and configure the optional stop/start buttons together with **Auto-stop tracking helper** if you want the blueprint to stop the session instead of clamping to the minimum current. Use **Stop delay below minimum** to require the below-minimum condition to persist before stopping.
 - While an auto-stopped session is waiting for restart, the blueprint intentionally does not restore **Non-charging current limit**. When headroom returns, it writes the computed safe current first and then presses the start button.
 - The periodic recheck is also what resumes limiter control after a snooze expires if no relevant entity changes occur exactly at that moment.
@@ -118,3 +125,27 @@ Using a real EV power sensor is more accurate than estimating from the current c
 
 ## License
 This project is released under the MIT License.
+
+## Automatic stop and restart reliability
+
+- For DEFA, select **Start charging** as the restart button. **Charge now** only
+  overrides a smart charging schedule and may be unavailable after a stop.
+- Restart requires raw available headroom to cover the minimum charging current;
+  a target clamped up to the minimum does not prove that capacity is available.
+- Commands run sequentially. Sensor updates cannot interrupt a stop/start sequence.
+  The auto-stop helper is set before Stop and retained until actual charging is
+  confirmed (or the charger explicitly reports `idle`). Unknown states retain it.
+- The stop persistence timer starts after the stop/start cooldown expires. This
+  intentionally allows cooldown plus the configured stop delay before another stop.
+- After Start, the automation waits up to one minute for charging confirmation.
+  If charging does not begin, tracking remains active for a later retry. Successful
+  button timestamps and helper changes enforce the configured cooldown. Service
+  errors without a button timestamp are retried no faster than once per minute.
+- A failed Stop waits up to 30 seconds for the state to change. If the charger still
+  reports charging, a subsequent run clears tracking and normal limiting continues.
+- Use a persistent input boolean without a forced startup `initial` value. After
+  reload/restart, current charger state and the helper reconcile on the next run.
+
+Regression tests: `python -m unittest discover -s tests -v` after installing
+`requirements-test.txt`. Tests evaluate the blueprint's actual templates and
+simulate its action sequences; they do not operate a real charger.

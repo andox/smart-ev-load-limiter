@@ -4,8 +4,8 @@ blueprint:
     Dynamically reduces EV charging current so your total household power stays
     below a configured limit. Reads a whole-house power sensor, optionally
     subtracts live EV charging power, respects a user-defined preferred max amp
-    setting, supports schedule-based activation, and allows a timed snooze for
-    manual override.
+    setting, supports separate power caps inside and outside a configured time
+    window, and allows a timed snooze for manual override.
   domain: automation
   source_url: https://github.com/andox/smart-ev-load-limiter
 
@@ -73,7 +73,7 @@ blueprint:
 
     house_max_power_w:
       name: House max power
-      description: Hard household power cap in watts.
+      description: Household power cap in watts during the normal-cap window.
       default: 10500
       selector:
         number:
@@ -149,18 +149,18 @@ blueprint:
       name: Start charging button (optional)
       description: >-
         Button entity used to resume charging after an automatic stop when
-        enough headroom returns.
+        enough headroom returns. For DEFA use Start charging, not Charge now
+        (the latter only overrides smart charging schedules).
       default: ""
       selector:
         entity:
           domain: button
 
     auto_stop_tracking_helper:
-      name: Auto-stop tracking helper (optional)
+      name: Auto-stop tracking helper (required for auto-stop)
       description: >-
         Input boolean used to track whether this blueprint automatically stopped
-        charging. Configure this if you enable stop/start support so cooldown and
-        automatic restart behavior stay reliable.
+        charging. Automatic stop/start is disabled unless this helper is configured.
       default: ""
       selector:
         entity:
@@ -209,15 +209,15 @@ blueprint:
           mode: box
 
     always_active:
-      name: Always active
-      description: Enable the limiter all day, every day.
+      name: Always use normal cap
+      description: Ignore the schedule and use the normal power cap all day, every day.
       default: true
       selector:
         boolean: {}
 
     active_weekdays:
-      name: Active weekdays
-      description: Weekdays when the limiter is allowed to run when always-active is off.
+      name: Normal-cap weekdays
+      description: Weekdays when the normal power cap applies if the schedule is enabled.
       default:
         - mon
         - tue
@@ -246,18 +246,50 @@ blueprint:
               value: sun
 
     active_start_time:
-      name: Active start time
-      description: Start time for the active window when always-active is off.
+      name: Normal-cap start time
+      description: Start of the normal-cap window when the schedule is enabled.
       default: "00:00:00"
       selector:
         time: {}
 
     active_end_time:
-      name: Active end time
-      description: End time for the active window when always-active is off.
+      name: Normal-cap end time
+      description: End of the normal-cap window when the schedule is enabled.
       default: "00:00:00"
       selector:
         time: {}
+
+    outside_active_hours_behavior:
+      name: Outside normal-cap window
+      description: >-
+        Choose what the limiter does outside the configured normal-cap weekdays
+        and time window. Disable restores the non-charging current limit, separate
+        uses the outside-window cap, and normal keeps the regular power cap.
+      default: disable_limiter
+      selector:
+        select:
+          options:
+            - label: Disable limiter
+              value: disable_limiter
+            - label: Use separate power cap
+              value: relaxed_power_cap
+            - label: Keep normal power cap
+              value: normal_power_cap
+
+    relaxed_house_max_power_w:
+      name: Outside-window house max power
+      description: >-
+        Absolute household power cap used outside the normal-cap window when the
+        separate-cap behavior is selected. This is not an amount added to the
+        normal cap; choose a higher value if you want looser limiting.
+      default: 16000
+      selector:
+        number:
+          min: 0
+          max: 100000
+          step: 100
+          unit_of_measurement: W
+          mode: box
 
     poll_interval_minutes:
       name: Poll interval
@@ -334,7 +366,11 @@ blueprint:
       selector:
         duration: {}
 
-mode: restart
+# Serialize commands and their tracking updates; charger updates must not cancel them.
+# Action variables are evaluated afresh when each queued run starts.
+mode: queued
+max: 20
+max_exceeded: silent
 
 trigger_variables:
   poll_interval_minutes: !input poll_interval_minutes
@@ -345,12 +381,20 @@ trigger_variables:
   charge_state_sensor: !input charge_state_sensor
   charging_states: !input charging_states
   house_max_power_w: !input house_max_power_w
+  relaxed_house_max_power_w: !input relaxed_house_max_power_w
   minimum_charging_amps: !input minimum_charging_amps
   phase_count: !input phase_count
   volts_per_phase: !input volts_per_phase
   stop_when_below_minimum: !input stop_when_below_minimum
   stop_charging_button: !input stop_charging_button
+  start_charging_button: !input start_charging_button
+  stop_start_cooldown: !input stop_start_cooldown
   auto_stop_tracking_helper: !input auto_stop_tracking_helper
+  always_active: !input always_active
+  active_weekdays: !input active_weekdays
+  active_start_time: !input active_start_time
+  active_end_time: !input active_end_time
+  outside_active_hours_behavior: !input outside_active_hours_behavior
 
 variables:
   house_power_sensor: !input house_power_sensor
@@ -375,6 +419,8 @@ variables:
   active_weekdays: !input active_weekdays
   active_start_time: !input active_start_time
   active_end_time: !input active_end_time
+  outside_active_hours_behavior: !input outside_active_hours_behavior
+  relaxed_house_max_power_w: !input relaxed_house_max_power_w
   minimum_adjustment_amps: !input minimum_adjustment_amps
   adjustment_cooldown: !input adjustment_cooldown
   enable_notifications: !input enable_notifications
@@ -397,14 +443,38 @@ trigger:
       {% set invalid = ['unknown', 'unavailable', 'none', ''] %}
       {% set charge_state = states(charge_state_sensor) %}
       {% set is_charging = charge_state in (charging_states | default([], true)) %}
+      {% set time_now = now().strftime('%H:%M:%S') %}
+      {% set weekday_keys = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] %}
+      {% set overnight = active_start_time != active_end_time and active_start_time > active_end_time %}
+      {% set schedule_weekday = weekday_keys[(now().weekday() - 1) % 7] if overnight and time_now < active_end_time else weekday_keys[now().weekday()] %}
+      {% if active_start_time == active_end_time %}
+        {% set in_window = true %}
+      {% elif active_start_time < active_end_time %}
+        {% set in_window = active_start_time <= time_now < active_end_time %}
+      {% else %}
+        {% set in_window = time_now >= active_start_time or time_now < active_end_time %}
+      {% endif %}
+      {% set normal_cap_window_active = always_active or (schedule_weekday in (active_weekdays | default([], true)) and in_window) %}
+      {% set limiter_active = normal_cap_window_active or outside_active_hours_behavior in ['relaxed_power_cap', 'normal_power_cap'] %}
+      {% set effective_house_max = relaxed_house_max_power_w if (not normal_cap_window_active and outside_active_hours_behavior == 'relaxed_power_cap') else house_max_power_w %}
       {% set house_raw = states(house_power_sensor) %}
       {% set charger_raw = states(charger_limit_entity) %}
+      {# Start the persistence timer only after cooldown, so its one-shot event
+         cannot be consumed while stopping is still prohibited. #}
+      {% set d = stop_start_cooldown %}
+      {% set cooldown = (d.days | default(0) | int) * 86400 + (d.hours | default(0) | int) * 3600 + (d.minutes | default(0) | int) * 60 + (d.seconds | default(0) | int) %}
+      {% set helper = states[auto_stop_tracking_helper] if auto_stop_tracking_helper else none %}
+      {% set helper_ts = as_timestamp(helper.last_changed, 0) if helper is not none else 0 %}
+      {% set last_press = [as_timestamp(states(stop_charging_button), 0), as_timestamp(states(start_charging_button), 0), helper_ts] | max %}
       {% if (not stop_when_below_minimum)
+            or not is_state(auto_stop_tracking_helper, 'off')
+            or as_timestamp(now()) - last_press < cooldown
             or (stop_charging_button | default('', true) | length == 0)
             or (auto_stop_tracking_helper | default('', true) | length == 0)
             or (states(stop_charging_button) == 'unavailable')
             or (house_raw in invalid)
             or (charger_raw in invalid)
+            or (not limiter_active)
             or (not is_charging) %}
         false
       {% else %}
@@ -430,7 +500,7 @@ trigger:
         {% if base_load is none or watts_per_amp <= 0 %}
           false
         {% else %}
-          {% set available_ev_w = [(house_max_power_w | float(0)) - base_load, 0] | max %}
+          {% set available_ev_w = [(effective_house_max | float(0)) - base_load, 0] | max %}
           {% set raw_target = (available_ev_w / watts_per_amp) | int(0) %}
           {{ raw_target < effective_min and ((current_amps | round(0, 'floor') | int(0)) <= effective_min) }}
         {% endif %}
@@ -506,8 +576,18 @@ action:
         {% else %}
           {{ time_now >= active_start_time or time_now < active_end_time }}
         {% endif %}
-      schedule_active: >
+      normal_cap_window_active: >
         {{ always_active or ((schedule_weekday_key in (active_weekdays | default([], true))) and (in_time_window | bool)) }}
+      outside_window_separate_cap_active: >
+        {{ (not normal_cap_window_active) and outside_active_hours_behavior == 'relaxed_power_cap' }}
+      limiter_active: >
+        {{ normal_cap_window_active or outside_active_hours_behavior in ['relaxed_power_cap', 'normal_power_cap'] }}
+      effective_house_max_power_w: >
+        {% if outside_window_separate_cap_active %}
+          {{ relaxed_house_max_power_w | float(0) }}
+        {% else %}
+          {{ house_max_power_w | float(0) }}
+        {% endif %}
       house_power_raw: "{{ states(house_power_sensor) }}"
       house_power_unit: "{{ state_attr(house_power_sensor, 'unit_of_measurement') | default('W', true) | string | lower | replace(' ', '') }}"
       house_power_available: "{{ house_power_raw not in invalid_states }}"
@@ -647,9 +727,12 @@ action:
       start_button_available: >
         {{ (start_charging_button | default('', true) | length > 0)
            and (states(start_charging_button) != 'unavailable') }}
+      last_stop_start_ts: >
+        {{ [auto_stop_helper_last_changed_ts | float(0),
+            as_timestamp(states(stop_charging_button), 0),
+            as_timestamp(states(start_charging_button), 0)] | max }}
       stop_start_cooldown_elapsed: >
-        {{ (not auto_stop_helper_configured)
-           or ((now_ts | float(0)) - (auto_stop_helper_last_changed_ts | float(0)) >= (stop_start_cooldown_seconds | int(0))) }}
+        {{ (now_ts | float(0)) - (last_stop_start_ts | float(0)) >= (stop_start_cooldown_seconds | int(0)) }}
       sensor_values_available: >
         {{ house_power_available and charger_limit_available and ((not ev_power_required) or ev_power_available) }}
       base_load_w: >
@@ -664,7 +747,7 @@ action:
         {% if base_load_w is none %}
           {{ none }}
         {% else %}
-          {{ [(house_max_power_w | float(0)) - (base_load_w | float(0)), 0] | max }}
+          {{ [(effective_house_max_power_w | float(0)) - (base_load_w | float(0)), 0] | max }}
         {% endif %}
       raw_target_amps: >
         {% if available_ev_w is none or (watts_per_amp | float(0)) <= 0 %}
@@ -680,7 +763,7 @@ action:
         {% else %}
           {% set upper = preferred_ceiling_amps | int(0) %}
           {% set clamped = [[raw_target_amps | int(0), upper] | min, 0] | max %}
-          {% if clamped > 0 and clamped < (effective_minimum_amps | int(0)) %}
+          {% if clamped < (effective_minimum_amps | int(0)) %}
             {% if charger_supports_zero %}
               0
             {% else %}
@@ -694,7 +777,7 @@ action:
         {{ (snooze_duration_seconds | int(0) > 0)
            and (charger_last_change_user_id is not none)
            and ((now_ts | float(0)) - (charger_last_change_ts | float(0)) < (snooze_duration_seconds | int(0)))
-           and schedule_active
+           and limiter_active
            and is_charging
            and (computed_target_amps is not none)
            and ((current_limit_amps | round(0, 'floor') | int(0)) != (computed_target_amps | int(0))) }}
@@ -725,7 +808,7 @@ action:
         {{ stop_when_below_minimum
            and auto_stop_helper_configured
            and stop_button_available
-           and schedule_active
+           and limiter_active
            and is_charging
            and below_minimum_headroom
            and charger_at_effective_minimum
@@ -737,23 +820,33 @@ action:
         {{ stop_when_below_minimum
            and auto_stop_helper_configured
            and start_button_available
-           and schedule_active
+           and limiter_active
            and session_present
            and (not is_charging)
            and auto_stop_active
            and stop_start_cooldown_elapsed
+           and (raw_target_amps is not none)
+           and ((raw_target_amps | int(0)) >= (effective_minimum_amps | int(0)))
            and (computed_target_amps is not none)
            and ((computed_target_amps | int(0)) >= (effective_minimum_amps | int(0))) }}
       should_clear_auto_stop_tracking: >
-        {{ auto_stop_helper_configured and auto_stop_active and charge_state_became_charging }}
+        {{ auto_stop_helper_configured and auto_stop_active and (is_charging or charge_state_value == 'idle') }}
       notification_message: >
         House load is {{ (house_power_w | float(0)) | round(0) | int(0) }} W and
         the charger was reduced from
         {{ current_limit_amps | round(0, 'floor') | int(0) }} A to
         {{ computed_target_amps | int(0) }} A to stay below
-        {{ house_max_power_w | int(0) }} W.
+        {{ effective_house_max_power_w | int(0) }} W.
 
   - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ should_clear_auto_stop_tracking }}"
+        sequence:
+          - service: input_boolean.turn_off
+            target:
+              entity_id: "{{ auto_stop_tracking_helper }}"
+
       - conditions:
           - condition: template
             value_template: "{{ not periodic_trigger_due }}"
@@ -795,14 +888,6 @@ action:
 
       - conditions:
           - condition: template
-            value_template: "{{ should_clear_auto_stop_tracking }}"
-        sequence:
-          - service: input_boolean.turn_off
-            target:
-              entity_id: "{{ auto_stop_tracking_helper }}"
-
-      - conditions:
-          - condition: template
             value_template: "{{ should_start_after_auto_stop }}"
         sequence:
           - if:
@@ -817,15 +902,25 @@ action:
                 data:
                   value: "{{ computed_target_amps | int(0) }}"
           - service: button.press
+            continue_on_error: true
             target:
               entity_id: "{{ start_charging_button }}"
-          - service: input_boolean.turn_off
-            target:
-              entity_id: "{{ auto_stop_tracking_helper }}"
+          # Keep ownership until charging is observed, not just API acceptance.
+          # Also bounds retries when a failed service provides no button timestamp.
+          - wait_template: "{{ states(charge_state_sensor) in charging_states }}"
+            timeout: "00:01:00"
+            continue_on_timeout: true
+          - if:
+              - condition: template
+                value_template: "{{ states(charge_state_sensor) in charging_states }}"
+            then:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: "{{ auto_stop_tracking_helper }}"
 
       - conditions:
           - condition: template
-            value_template: "{{ (not schedule_active) or ((not is_charging) and (not auto_stop_active)) }}"
+            value_template: "{{ (not limiter_active) or ((not is_charging) and (not auto_stop_active)) }}"
           - condition: template
             value_template: "{{ current_limit_amps is not none and (current_limit_amps | round(0, 'floor') | int(0)) != (inactive_restore_amps | int(0)) }}"
         sequence:
@@ -839,16 +934,21 @@ action:
           - condition: template
             value_template: "{{ should_stop_for_low_headroom }}"
         sequence:
-          - service: button.press
-            target:
-              entity_id: "{{ stop_charging_button }}"
+          # Persist ownership before contacting the charger, including across HA restarts.
           - service: input_boolean.turn_on
             target:
               entity_id: "{{ auto_stop_tracking_helper }}"
+          - service: button.press
+            continue_on_error: true
+            target:
+              entity_id: "{{ stop_charging_button }}"
+          - wait_template: "{{ states(charge_state_sensor) not in charging_states }}"
+            timeout: "00:00:30"
+            continue_on_timeout: true
 
       - conditions:
           - condition: template
-            value_template: "{{ schedule_active }}"
+            value_template: "{{ limiter_active }}"
           - condition: template
             value_template: "{{ is_charging }}"
           - condition: template
